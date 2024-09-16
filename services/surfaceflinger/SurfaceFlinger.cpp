@@ -79,6 +79,7 @@
 #include "Transform.h"
 #include "clz.h"
 
+#include "DisplayUtils.h"
 #include "DisplayHardware/ComposerHal.h"
 #include "DisplayHardware/FramebufferSurface.h"
 #include "DisplayHardware/HWComposer.h"
@@ -2544,6 +2545,7 @@ void SurfaceFlinger::processDisplayChangesLocked() {
                     if (state.surface != nullptr) {
                         // Allow VR composer to use virtual displays.
                         if (mUseHwcVirtualDisplays || getBE().mHwc->isUsingVrComposer()) {
+                            DisplayUtils *displayUtils = DisplayUtils::getInstance();
                             int width = 0;
                             int status = state.surface->query(NATIVE_WINDOW_WIDTH, &width);
                             ALOGE_IF(status != NO_ERROR, "Unable to query width (%d)", status);
@@ -2555,18 +2557,27 @@ void SurfaceFlinger::processDisplayChangesLocked() {
                             ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
                             auto format = static_cast<ui::PixelFormat>(intFormat);
 
-                            getBE().mHwc->allocateVirtualDisplay(width, height, &format, &hwcId);
+                            if (maxVirtualDisplaySize == 0 ||
+                                 ( (uint64_t)width <= maxVirtualDisplaySize &&
+                                 (uint64_t)height <= maxVirtualDisplaySize)) {
+                                uint64_t usage = 0;
+                                // Replace with native_window_get_consumer_usage ?
+                                status = state.surface->getConsumerUsage(&usage);
+                                ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+                                if ( (status == NO_ERROR) &&
+                                     displayUtils->canAllocateHwcDisplayIdForVDS(usage)) {
+                                    getBE().mHwc->allocateVirtualDisplay(
+                                            width, height, &format, &hwcId);
+                                 }
+                            }
                         }
 
                         // TODO: Plumb requested format back up to consumer
-
-                        sp<VirtualDisplaySurface> vds =
-                                new VirtualDisplaySurface(*getBE().mHwc, hwcId, state.surface,
-                                                          bqProducer, bqConsumer,
-                                                          state.displayName);
-
-                        dispSurface = vds;
-                        producer = vds;
+                        DisplayUtils::getInstance()->initVDSInstance(*getBE().mHwc,
+                                                        hwcId, state.surface,
+                                                        dispSurface, producer,
+                                                        bqProducer, bqConsumer,
+                                                        state.displayName, state.isSecure);
                     }
                 } else {
                     ALOGE_IF(state.surface != nullptr,
@@ -3129,6 +3140,12 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& displayDev
                     break;
                 }
                 case HWC2::Composition::Client: {
+                    if ((hwcId < 0) &&
+                        (DisplayUtils::getInstance()->skipColorLayer(layer->getTypeId()))) {
+                        // We are not using h/w composer.
+                        // Skip color (dim) layer for WFD direct streaming.
+                        continue;
+                    }
                     layer->draw(renderArea, clip);
                     break;
                 }
@@ -3156,19 +3173,33 @@ void SurfaceFlinger::drawWormhole(const sp<const DisplayDevice>& displayDevice, 
     engine.fillRegionWithColor(region, height, 0, 0, 0, 0);
 }
 
-status_t SurfaceFlinger::addClientLayer(const sp<Client>& client,
-        const sp<IBinder>& handle,
-        const sp<IGraphicBufferProducer>& gbc,
-        const sp<Layer>& lbc,
-        const sp<Layer>& parent)
-{
+status_t SurfaceFlinger::addClientLayer(const sp<Client>& client, const sp<IBinder>& handle,
+                                        const sp<IGraphicBufferProducer>& gbc, const sp<Layer>& lbc,
+                                        const sp<IBinder>& parentHandle,
+                                        const sp<Layer>& parentLayer) {
     // add this layer to the current state list
     {
         Mutex::Autolock _l(mStateLock);
+        sp<Layer> parent;
+
+        if (parentHandle != nullptr) {
+            parent = fromHandle(parentHandle);
+            if (parent == nullptr) {
+                return NAME_NOT_FOUND;
+            }
+        } else {
+            parent = parentLayer;
+        }
+
         if (mNumLayers >= MAX_LAYERS) {
             ALOGE("AddClientLayer failed, mNumLayers (%zu) >= MAX_LAYERS (%zu)", mNumLayers,
                   MAX_LAYERS);
             return NO_MEMORY;
+        }
+
+        auto [itr, inserted] = mLayersByLocalBinderToken.emplace(handle->localBinder(), lbc);
+        if (!inserted) {
+          ALOGE("-----------ERROR REGISTERING HANDLE, layer pair: handle is already a key");
         }
         if (parent == nullptr) {
             mCurrentState.layersSortedByZ.add(lbc);
@@ -3201,6 +3232,24 @@ status_t SurfaceFlinger::addClientLayer(const sp<Client>& client,
 status_t SurfaceFlinger::removeLayer(const sp<Layer>& layer, bool topLevelOnly) {
     Mutex::Autolock _l(mStateLock);
     return removeLayerLocked(mStateLock, layer, topLevelOnly);
+}
+
+status_t SurfaceFlinger::removeLayerFromMap(Layer* layer) {
+    auto it = mLayersByLocalBinderToken.begin();
+    while (it != mLayersByLocalBinderToken.end()) {
+        auto strongRef = it->second.promote();
+        if (strongRef != nullptr && strongRef.get() == layer) {
+            it = mLayersByLocalBinderToken.erase(it);
+            break;
+        } else {
+            it++;
+        }
+    }
+    if (it == mLayersByLocalBinderToken.end()) {
+        ALOGE("Failed to remove layer from mapping - could not find matching layer");
+        return BAD_VALUE;
+    }
+    return NO_ERROR;
 }
 
 status_t SurfaceFlinger::removeLayerLocked(const Mutex&, const sp<Layer>& layer,
@@ -3639,13 +3688,12 @@ void SurfaceFlinger::setDestroyStateLocked(const ComposerState& composerState) {
     }
 }
 
-status_t SurfaceFlinger::createLayer(
-        const String8& name,
-        const sp<Client>& client,
-        uint32_t w, uint32_t h, PixelFormat format, uint32_t flags,
-        int32_t windowType, int32_t ownerUid, sp<IBinder>* handle,
-        sp<IGraphicBufferProducer>* gbp, sp<Layer>* parent)
-{
+status_t SurfaceFlinger::createLayer(const String8& name, const sp<Client>& client, uint32_t w,
+                                     uint32_t h, PixelFormat format, uint32_t flags,
+                                     int32_t windowType, int32_t ownerUid, sp<IBinder>* handle,
+                                     sp<IGraphicBufferProducer>* gbp,
+                                     const sp<IBinder>& parentHandle,
+                                     const sp<Layer>& parentLayer) {
     if (int32_t(w|h) < 0) {
         ALOGE("createLayer() failed, w or h is negative (w=%d, h=%d)",
                 int(w), int(h));
@@ -3693,7 +3741,7 @@ status_t SurfaceFlinger::createLayer(
 
     layer->setInfo(windowType, ownerUid);
 
-    result = addClientLayer(client, *handle, *gbp, layer, *parent);
+    result = addClientLayer(client, *handle, *gbp, layer, parentHandle, parentLayer);
     if (result != NO_ERROR) {
         return result;
     }
@@ -3745,7 +3793,8 @@ status_t SurfaceFlinger::createBufferLayer(const sp<Client>& client,
         break;
     }
 
-    sp<BufferLayer> layer = new BufferLayer(this, client, name, w, h, flags);
+    sp<BufferLayer> layer = DisplayUtils::getInstance()->getBufferLayerInstance(
+                            this, client, name, w, h, flags);
     status_t err = layer->setBuffers(w, h, format, flags);
     if (err == NO_ERROR) {
         *handle = layer->getHandle();
@@ -4872,11 +4921,13 @@ private:
     const int mApi;
 };
 
-status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display, sp<GraphicBuffer>* outBuffer,
+status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
+                                       sp<GraphicBuffer>* outBuffer, bool& outCapturedSecureLayers,
                                        Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
                                        int32_t minLayerZ, int32_t maxLayerZ,
                                        bool useIdentityTransform,
-                                       ISurfaceComposer::Rotation rotation) {
+                                       ISurfaceComposer::Rotation rotation,
+                                       bool captureSecureLayers) {
     ATRACE_CALL();
 
     if (CC_UNLIKELY(display == 0)) return BAD_VALUE;
@@ -4898,11 +4949,13 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display, sp<GraphicBuf
         }
     }
 
-    DisplayRenderArea renderArea(device, sourceCrop, reqWidth, reqHeight, renderAreaRotation);
+    DisplayRenderArea renderArea(device, sourceCrop, reqWidth, reqHeight, renderAreaRotation,
+                                 captureSecureLayers);
 
     auto traverseLayers = std::bind(std::mem_fn(&SurfaceFlinger::traverseLayersInDisplay), this,
                                     device, minLayerZ, maxLayerZ, std::placeholders::_1);
-    return captureScreenCommon(renderArea, traverseLayers, outBuffer, useIdentityTransform);
+    return captureScreenCommon(renderArea, traverseLayers, outBuffer, useIdentityTransform,
+                               outCapturedSecureLayers);
 }
 
 status_t SurfaceFlinger::captureLayers(const sp<IBinder>& layerHandleBinder,
@@ -4982,34 +5035,40 @@ status_t SurfaceFlinger::captureLayers(const sp<IBinder>& layerHandleBinder,
         const bool mChildrenOnly;
     };
 
-    auto layerHandle = reinterpret_cast<Layer::Handle*>(layerHandleBinder.get());
-    auto parent = layerHandle->owner.promote();
-
-    if (parent == nullptr || parent->isPendingRemoval()) {
-        ALOGE("captureLayers called with a removed parent");
-        return NAME_NOT_FOUND;
-    }
-
-    const int uid = IPCThreadState::self()->getCallingUid();
-    const bool forSystem = uid == AID_GRAPHICS || uid == AID_SYSTEM;
-    if (!forSystem && parent->getCurrentState().flags & layer_state_t::eLayerSecure) {
-        ALOGW("Attempting to capture secure layer: PERMISSION_DENIED");
-        return PERMISSION_DENIED;
-    }
-
+    int reqWidth = 0;
+    int reqHeight = 0;
+    sp<Layer> parent;
     Rect crop(sourceCrop);
-    if (sourceCrop.width() <= 0) {
-        crop.left = 0;
-        crop.right = parent->getCurrentState().active.w;
-    }
 
-    if (sourceCrop.height() <= 0) {
-        crop.top = 0;
-        crop.bottom = parent->getCurrentState().active.h;
-    }
+    {
+        Mutex::Autolock _l(mStateLock);
 
-    int32_t reqWidth = crop.width() * frameScale;
-    int32_t reqHeight = crop.height() * frameScale;
+        parent = fromHandle(layerHandleBinder);
+        if (parent == nullptr || parent->isPendingRemoval()) {
+            ALOGE("captureLayers called with an invalid or removed parent");
+            return NAME_NOT_FOUND;
+        }
+
+        const int uid = IPCThreadState::self()->getCallingUid();
+        const bool forSystem = uid == AID_GRAPHICS || uid == AID_SYSTEM;
+        if (!forSystem && parent->getCurrentState().flags & layer_state_t::eLayerSecure) {
+            ALOGW("Attempting to capture secure layer: PERMISSION_DENIED");
+            return PERMISSION_DENIED;
+        }
+
+        if (sourceCrop.width() <= 0) {
+            crop.left = 0;
+            crop.right = parent->getCurrentState().active.w;
+        }
+
+        if (sourceCrop.height() <= 0) {
+            crop.top = 0;
+            crop.bottom = parent->getCurrentState().active.h;
+        }
+
+        reqWidth = crop.width() * frameScale;
+        reqHeight = crop.height() * frameScale;
+    } // mStateLock
 
     // really small crop or frameScale
     if (reqWidth <= 0) {
@@ -5031,13 +5090,16 @@ status_t SurfaceFlinger::captureLayers(const sp<IBinder>& layerHandleBinder,
             visitor(layer);
         });
     };
-    return captureScreenCommon(renderArea, traverseLayers, outBuffer, false);
+    bool outCapturedSecureLayers = false;
+    return captureScreenCommon(renderArea, traverseLayers, outBuffer, false,
+                               outCapturedSecureLayers);
 }
 
 status_t SurfaceFlinger::captureScreenCommon(RenderArea& renderArea,
                                              TraverseLayersFunction traverseLayers,
                                              sp<GraphicBuffer>* outBuffer,
-                                             bool useIdentityTransform) {
+                                             bool useIdentityTransform,
+                                             bool& outCapturedSecureLayers) {
     ATRACE_CALL();
 
     const uint32_t usage = GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN |
@@ -5073,7 +5135,8 @@ status_t SurfaceFlinger::captureScreenCommon(RenderArea& renderArea,
             Mutex::Autolock _l(mStateLock);
             renderArea.render([&]() {
                 result = captureScreenImplLocked(renderArea, traverseLayers, (*outBuffer).get(),
-                                                 useIdentityTransform, forSystem, &fd);
+                                                 useIdentityTransform, forSystem, &fd,
+                                                 outCapturedSecureLayers);
             });
         }
 
@@ -5146,21 +5209,19 @@ void SurfaceFlinger::renderScreenImplLocked(const RenderArea& renderArea,
 status_t SurfaceFlinger::captureScreenImplLocked(const RenderArea& renderArea,
                                                  TraverseLayersFunction traverseLayers,
                                                  ANativeWindowBuffer* buffer,
-                                                 bool useIdentityTransform,
-                                                 bool forSystem,
-                                                 int* outSyncFd) {
+                                                 bool useIdentityTransform, bool forSystem,
+                                                 int* outSyncFd, bool& outCapturedSecureLayers) {
     ATRACE_CALL();
 
-    bool secureLayerIsVisible = false;
-
     traverseLayers([&](Layer* layer) {
-        secureLayerIsVisible = secureLayerIsVisible || (layer->isVisible() && layer->isSecure());
+        outCapturedSecureLayers =
+                outCapturedSecureLayers || (layer->isVisible() && layer->isSecure());
     });
 
     // We allow the system server to take screenshots of secure layers for
     // use in situations like the Screen-rotation animation and place
     // the impetus on WindowManager to not persist them.
-    if (secureLayerIsVisible && !forSystem) {
+    if (outCapturedSecureLayers && !forSystem) {
         ALOGW("FB is protected: PERMISSION_DENIED");
         return PERMISSION_DENIED;
     }
@@ -5260,8 +5321,20 @@ void SurfaceFlinger::traverseLayersInDisplay(const sp<const DisplayDevice>& hw, 
     }
 }
 
-}; // namespace android
+sp<Layer> SurfaceFlinger::fromHandle(const sp<IBinder>& handle) {
+    BBinder *b = handle->localBinder();
+    if (b == nullptr) {
+        return nullptr;
+    }
+    auto it = mLayersByLocalBinderToken.find(b);
+    if (it != mLayersByLocalBinderToken.end()) {
+        auto ret = it->second.promote();
+        return ret;
+    }
+    return nullptr;
+}
 
+} // namespace android
 
 #if defined(__gl_h_)
 #error "don't include gl/gl.h in this file"
